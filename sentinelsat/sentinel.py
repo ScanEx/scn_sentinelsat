@@ -7,14 +7,19 @@ from collections import OrderedDict, defaultdict, namedtuple
 from copy import copy
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict
-from urllib.parse import quote_plus, urljoin
+try:
+    from urllib.parse import quote_plus, urljoin
+except ImportError:
+    from six.moves.urllib.parse import quote_plus, urljoin
+
+import sys
+if sys.version_info.major == 3:
+    basestring = str
+    xrange = range
 
 import geojson
 import geomet.wkt
-import html2text
 import requests
-from tqdm.auto import tqdm
 
 from sentinelsat.download import DownloadStatus, Downloader
 from sentinelsat.exceptions import (
@@ -26,7 +31,6 @@ from sentinelsat.exceptions import (
     ServerError,
     UnauthorizedError,
 )
-from . import __version__ as sentinelsat_version
 
 
 class SentinelAPI:
@@ -43,8 +47,6 @@ class SentinelAPI:
     api_url : string, optional
         URL of the DataHub
         defaults to 'https://apihub.copernicus.eu/apihub'
-    show_progressbars : bool
-        Whether progressbars should be shown or not, e.g. during download. Defaults to True.
     timeout : float or tuple, default 60
         How long to wait for DataHub response (in seconds).
         Tuple (connect, read) allowed.
@@ -70,18 +72,17 @@ class SentinelAPI:
         user,
         password,
         api_url="https://apihub.copernicus.eu/apihub/",
-        show_progressbars=True,
         timeout=60,
+        cert=True
     ):
         self.session = requests.Session()
         if user and password:
             self.session.auth = (user, password)
         self.api_url = api_url if api_url.endswith("/") else api_url + "/"
         self.page_size = 100
-        self.user_agent = "sentinelsat/" + sentinelsat_version
-        self.session.headers["User-Agent"] = self.user_agent
+        self.session.headers["User-Agent"] = "sentinelsat"
         self.session.timeout = timeout
-        self.show_progressbars = show_progressbars
+        self.check_cert = cert
         self._dhus_version = None
         # For unit tests
         self._last_query = None
@@ -164,14 +165,14 @@ class SentinelAPI:
     def _req_dhus_stub(self):
         try:
             with self.dl_limit_semaphore:
-                resp = self.session.get(self.api_url + "api/stub/version")
+                resp = self.session.get(self.api_url + "api/stub/version", verify=self.check_cert)
             resp.raise_for_status()
         except requests.exceptions.HTTPError as err:
             self.logger.error("HTTPError: %s", err)
             self.logger.error("Are you trying to get the DHuS version of APIHub?")
             self.logger.error("Trying again after conversion to DHuS URL")
             with self.dl_limit_semaphore:
-                resp = self.session.get(self._api2dhus_url(self.api_url) + "api/stub/version")
+                resp = self.session.get(self._api2dhus_url(self.api_url) + "api/stub/version", verify=self.check_cert)
             resp.raise_for_status()
         return resp.json()["value"]
 
@@ -279,9 +280,64 @@ class SentinelAPI:
             query,
         )
         formatted_order_by = _format_order_by(order_by)
-        response, count = self._load_query(query, formatted_order_by, limit, offset)
-        self.logger.info(f"Found {count:,} products")
+
+        response, _  = self._load_query(query, formatted_order_by, limit, offset)
+        
         return _parse_opensearch_response(response)
+
+    def lazy_query(
+        self,
+        area=None,
+        date=None,
+        raw=None,
+        area_relation="Intersects",
+        order_by=None,
+        limit=None,
+        offset=0,
+        **keywords
+    ):
+        """Lazy query"""
+        query = self.format_query(area, date, raw, area_relation, **keywords)
+
+        if query.strip() == "":
+            # An empty query should return the full set of products on the server, which is a bit unreasonable.
+            # The server actually raises an error instead and it's better to fail early in the client.
+            raise ValueError("Empty query.")
+
+        # check query length - often caused by complex polygons
+        if self.check_query_length(query) > 1.0:
+            self.logger.warning(
+                "The query string is too long and will likely cause a bad DHuS response."
+            )
+
+        self.logger.debug(
+            "Running query: order_by=%s, limit=%s, offset=%s, query=%s",
+            order_by,
+            limit,
+            offset,
+            query,
+        )
+        formatted_order_by = _format_order_by(order_by)
+
+        ret, count = self._load_subquery(query, formatted_order_by, limit, offset)
+        self.logger.info("Found {} products".format(count))
+
+        # repeat query until all results have been loaded
+        max_offset = count
+
+        if limit is not None:
+            max_offset = min(count, offset + limit)
+        if max_offset > offset + self.page_size:
+            for new_offset in range(offset, max_offset, self.page_size):
+                new_limit = limit
+                if limit is not None:
+                    new_limit = limit - new_offset + offset
+                self.logger.info("Load batch {}-{}".format(new_offset, new_offset+self.page_size))
+                ret = self._load_subquery(query, formatted_order_by, new_limit, new_offset)[0]
+                
+                yield _parse_opensearch_response(ret)
+        else:
+            yield _parse_opensearch_response(ret)
 
     @staticmethod
     def format_query(area=None, date=None, raw=None, area_relation="Intersects", **keywords):
@@ -313,13 +369,13 @@ class SentinelAPI:
                 for sub_value in value:
                     sub_value = _format_query_value(attr, sub_value)
                     if sub_value is not None:
-                        sub_parts.append(f"{attr}:{sub_value}")
+                        sub_parts.append("{}:{}".format(attr,sub_value))
                 sub_parts = sorted(sub_parts)
                 query_parts.append("({})".format(" OR ".join(sub_parts)))
             else:
                 value = _format_query_value(attr, value)
                 if value is not None:
-                    query_parts.append(f"{attr}:{value}")
+                    query_parts.append("{}:{}".format(attr,value))
 
         if raw:
             query_parts.append(raw)
@@ -353,26 +409,20 @@ class SentinelAPI:
 
     def _load_query(self, query, order_by=None, limit=None, offset=0):
         products, count = self._load_subquery(query, order_by, limit, offset)
+        self.logger.info("Found {} products".format(count))
 
         # repeat query until all results have been loaded
         max_offset = count
+
         if limit is not None:
             max_offset = min(count, offset + limit)
         if max_offset > offset + self.page_size:
-            progress = self._tqdm(
-                desc="Querying products",
-                initial=self.page_size,
-                total=max_offset - offset,
-                unit="product",
-            )
             for new_offset in range(offset + self.page_size, max_offset, self.page_size):
                 new_limit = limit
                 if limit is not None:
                     new_limit = limit - new_offset + offset
                 ret = self._load_subquery(query, order_by, new_limit, new_offset)[0]
-                progress.update(len(ret))
                 products += ret
-            progress.close()
 
         return products, count
 
@@ -383,10 +433,22 @@ class SentinelAPI:
 
         # load query results
         url = self._format_url(order_by, limit, offset)
-        # Unlike POST, DHuS only accepts latin1 charset in the GET params
-        with self.dl_limit_semaphore:
-            response = self.session.get(url, params={"q": query.encode("latin1")})
-        self._check_scihub_response(response, query_string=query)
+        
+        attempts = 0
+        err = None
+        while attempts < 5:
+            try:
+                # Unlike POST, DHuS only accepts latin1 charset in the GET params
+                with self.dl_limit_semaphore:
+                    response = self.session.get(url, params={"q": query.encode("latin1")}, verify=self.check_cert)
+                self._check_scihub_response(response, query_string=query)
+                break
+            except ServerError as e:
+                attempts += 1
+                self.logger.warning("Attempt {} failed".format(attempts))
+                err = e
+        else:
+            raise Exception("Maximum retry (5) exceeded. Server error:", err, e)
 
         # store last status code (for testing)
         self._last_response = response
@@ -507,7 +569,7 @@ class SentinelAPI:
         if full:
             url += "&$expand=Attributes"
         with self.dl_limit_semaphore:
-            response = self.session.get(url)
+            response = self.session.get(url, verify=self.check_cert)
         self._check_scihub_response(response)
         values = _parse_odata_response(response.json()["d"])
         values["quicklook_url"] = self._get_odata_url(id, "/Products('Quicklook')/$value")
@@ -536,7 +598,7 @@ class SentinelAPI:
             return True
         url = self._get_odata_url(id, "/Online/$value")
         with self.dl_limit_semaphore:
-            r = self.session.get(url)
+            r = self.session.get(url, verify=self.check_cert)
         try:
             self._check_scihub_response(r)
         except ServerError as e:
@@ -600,7 +662,8 @@ class SentinelAPI:
                 return filename
         with self.dl_limit_semaphore:
             req = self.session.get(
-                product_info["url"].replace("$value", "Attributes('Filename')/Value/$value")
+                product_info["url"].replace("$value", "Attributes('Filename')/Value/$value"),
+                verify=self.check_cert
             )
         self._check_scihub_response(req, test_json=False)
         filename = req.text
@@ -944,7 +1007,7 @@ class SentinelAPI:
 
         return corrupt
 
-    def _checksum_compare(self, file_path, product_info, block_size=2**13):
+    def _checksum_compare(self, file_path, product_info, block_size=2 ** 13):
         """Compare a given MD5 checksum with one calculated from a file."""
         if "sha3-256" in product_info:
             checksum = product_info["sha3-256"]
@@ -956,26 +1019,14 @@ class SentinelAPI:
             raise InvalidChecksumError("No checksum information found in product information.")
         file_path = Path(file_path)
         file_size = file_path.stat().st_size
-        with self._tqdm(
-            desc=f"{algo.name.upper()} checksumming",
-            total=file_size,
-            unit="B",
-            unit_scale=True,
-            leave=False,
-        ) as progress:
-            with open(file_path, "rb") as f:
-                while True:
-                    block_data = f.read(block_size)
-                    if not block_data:
-                        break
-                    algo.update(block_data)
-                    progress.update(len(block_data))
-            return algo.hexdigest().lower() == checksum.lower()
 
-    def _tqdm(self, **kwargs):
-        """tqdm progressbar wrapper. May be overridden to customize progressbar behavior"""
-        kwargs.update({"disable": not self.show_progressbars})
-        return tqdm(**kwargs)
+        with open(file_path, "rb") as f:
+            while True:
+                block_data = f.read(block_size)
+                if not block_data:
+                    break
+                algo.update(block_data)
+        return algo.hexdigest().lower() == checksum.lower()
 
     def get_stream(self, id, **kwargs):
         """Exposes requests response ready to stream product to e.g. S3.
@@ -1002,7 +1053,7 @@ class SentinelAPI:
         return self.downloader.get_stream(id, **kwargs)
 
     def _get_odata_url(self, uuid, suffix=""):
-        return self.api_url + f"odata/v1/Products('{uuid}')" + suffix
+        return self.api_url + "odata/v1/Products('{}')".format(uuid) + suffix
 
     def _get_download_url(self, uuid):
         return self._get_odata_url(uuid, "/$value")
@@ -1027,10 +1078,7 @@ class SentinelAPI:
                 except Exception:
                     if not response.text.lstrip().startswith("{"):
                         try:
-                            h = html2text.HTML2Text()
-                            h.ignore_images = True
-                            h.ignore_anchors = True
-                            msg = h.handle(response.text).strip()
+                            msg = response.text.strip()
                         except Exception:
                             pass
 
@@ -1054,7 +1102,7 @@ class SentinelAPI:
                         "Consider using SentinelAPI.check_query_length() for "
                         "client-side validation of the query string length.".format(length)
                     )
-                raise QueryLengthError(msg, response) from None
+                raise QueryLengthError(msg, response)
             elif "Invalid key" in msg:
                 msg = msg.split(" : ", 1)[-1]
                 raise InvalidKeyError(msg, response)
@@ -1077,7 +1125,7 @@ class SentinelAPI:
         elif urltype is None:
             urltype = ""
         # else: pass urltype as is
-        return self._get_odata_url(id, f"/Nodes('{title}.SAFE')/{path}{urltype}")
+        return self._get_odata_url(id, "/Nodes('{}.SAFE')/{}{}".format(title,path,urltype))
 
     def _get_manifest(self, product_info, path=None):
         path = Path(path) if path else None
@@ -1095,13 +1143,13 @@ class SentinelAPI:
 
         url = self._path_to_url(product_info, "manifest.safe", "json")
         with self.dl_limit_semaphore:
-            response = self.session.get(url)
+            response = self.session.get(url, verify=self.check_cert)
         self._check_scihub_response(response)
         info = response.json()["d"]
 
         node_info["size"] = int(info["ContentLength"])
         with self.dl_limit_semaphore:
-            response = self.session.get(node_info["url"])
+            response = self.session.get(node_info["url"], verify=self.check_cert)
         self._check_scihub_response(response, test_json=False)
         data = response.content
         if len(data) != node_info["size"]:
@@ -1183,7 +1231,7 @@ def _format_query_value(attr, value):
     if isinstance(value, str):
         value = value.strip()
         if value == "":
-            raise ValueError(f"Trying to filter '{attr}' with an empty string")
+            raise ValueError("Trying to filter '{}' with an empty string".format(attr))
         # Handle strings surrounded by brackets specially to allow the user to make use of Solr syntax directly.
         # The string must not be quoted for that to work.
         if (
@@ -1195,7 +1243,7 @@ def _format_query_value(attr, value):
             and "?" not in value
         ):
             value = re.sub(r"\s", " ", value, re.M)
-            value = f'"{value}"'
+            value = '"{}"'.format(value)
 
     # Handle date keywords
     # Keywords from https://github.com/SentinelDataHub/DataHubSystem/search?q=text/date+iso8601
@@ -1216,26 +1264,26 @@ def _format_query_value(attr, value):
             value = (format_query_date(value[0]), format_query_date(value[1]))
         else:
             raise ValueError(
-                f"Date-type query parameter '{attr}' expects either a two-element tuple of "
-                f"str or datetime objects or a '[<from> TO <to>]'-format string. Received {value}."
+                "Date-type query parameter '{}' expects either a two-element tuple of \
+                str or datetime objects or a '[<from> TO <to>]'-format string. Received {}.".format(attr,value)
             )
 
     if isinstance(value, set):
-        raise ValueError(f"Unexpected set-type value encountered with keyword '{attr}'")
+        raise ValueError("Unexpected set-type value encountered with keyword '{}'".format(attr))
     elif isinstance(value, (list, tuple)):
         # Handle value ranges
         if len(value) == 2:
             # Allow None or "*" to be used as an unlimited bound
             if any(x == "" for x in value):
-                raise ValueError(f"Trying to filter '{attr}' with an empty string")
-            value = ["*" if x in (None, "*") else f'"{x}"' for x in value]
+                raise ValueError("Trying to filter '{}' with an empty string".format(attr))
+            value = ["*" if x in (None, "*") else '"{}"'.format(x) for x in value]
             if value == ["*", "*"] or (is_date_attr and value == ["*", "NOW"]):
                 # Drop this keyword if both sides are unbounded
                 return
             value = "[{} TO {}]".format(*value)
         else:
             raise ValueError(
-                f"Invalid number of elements in list. Expected 2, received {len(value)}"
+                "Invalid number of elements in list. Expected 2, received {}".format(len(value))
             )
     return value
 
@@ -1342,6 +1390,17 @@ def _parse_odata_timestamp(in_date):
     return datetime.utcfromtimestamp(seconds) + timedelta(milliseconds=ms)
 
 
+def _fix_unicode(data):
+    if isinstance(data, unicode):
+        return data.encode('utf-8')
+    elif isinstance(data, dict):
+        data = dict((_fix_unicode(k), _fix_unicode(data[k])) for k in data)
+    elif isinstance(data, list):
+        for i in xrange(0, len(data)):
+            data[i] = _fix_unicode(data[i])
+    return data
+
+
 def _parse_opensearch_response(products):
     """Convert a query response to a dictionary.
 
@@ -1355,16 +1414,19 @@ def _parse_opensearch_response(products):
     # Keep the string type by default
     def default_converter(x):
         return x
+    prods = products
+    if sys.version_info.major == 2:
+        prods = _fix_unicode(products)
 
     output = OrderedDict()
-    for prod in products:
+    for prod in prods:
         product_dict = {}
         prod_id = prod["id"]
         output[prod_id] = product_dict
         for key in prod:
             if key == "id":
                 continue
-            if isinstance(prod[key], str):
+            if isinstance(prod[key], basestring):
                 product_dict[key] = prod[key]
             else:
                 properties = prod[key]

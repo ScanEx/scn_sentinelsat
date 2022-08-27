@@ -39,7 +39,7 @@ class LTATriggered(SentinelAPIError):
     def __init__(self, uuid):
         self.uuid = uuid
         super().__init__(
-            f"Product {uuid} is not online. Triggered retrieval from the Long Term Archive."
+            "Product {} is not online. Triggered retrieval from the Long Term Archive.".format(uuid)
         )
 
 

@@ -7,10 +7,18 @@ import time
 import traceback
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
 from pathlib import Path
-from typing import Any, Dict
 from xml.etree import ElementTree as etree
+
+
+import sys
+if sys.version_info.major == 2:
+    basestring = str
+    def auto(it=itertools.count()):
+        return next(it)
+
+    enum.auto = auto
+
 
 from sentinelsat.exceptions import (
     InvalidChecksumError,
@@ -20,7 +28,7 @@ from sentinelsat.exceptions import (
     ServerError,
     UnauthorizedError,
 )
-
+  
 
 class DownloadStatus(enum.Enum):
     """Status info for :meth:`Downloader.download_all()`.
@@ -76,7 +84,6 @@ class Downloader:
     def __init__(
         self,
         api,
-        *,
         node_filter=None,
         verify_checksum=True,
         fail_fast=False,
@@ -86,11 +93,10 @@ class Downloader:
         lta_retry_delay=60,
         lta_timeout=None
     ):
-        from sentinelsat import SentinelAPI
+        # from scihub import SentinelAPI
 
-        self.api: SentinelAPI = api
+        self.api = api
         self.logger = self.api.logger
-        self._tqdm = self.api._tqdm
 
         self.node_filter = node_filter
         self.verify_checksum = verify_checksum
@@ -100,9 +106,9 @@ class Downloader:
         self.dl_retry_delay = dl_retry_delay
         self.lta_retry_delay = lta_retry_delay
         self.lta_timeout = lta_timeout
-        self.chunk_size = 2**20  # download in 1 MB chunks by default
+        self.chunk_size = 2 ** 20  # download in 1 MB chunks by default
 
-    def download(self, id, directory=".", *, stop_event=None):
+    def download(self, id, directory=".", stop_event=None):
         """Download a product.
 
         Parameters
@@ -180,7 +186,7 @@ class Downloader:
             self._download_common(node_info, path, stop_event)
         return product_info
 
-    def _download_common(self, product_info: Dict[str, Any], path: Path, stop_event):
+    def _download_common(self, product_info, path, stop_event):
         # Use a temporary file for downloading
         temp_path = path.with_name(path.name + ".incomplete")
         skip_download = False
@@ -287,22 +293,13 @@ class Downloader:
             max_workers=max(1, min(self.n_concurrent_dl, dl_count)),
             thread_name_prefix="dl",
         )
-        dl_progress = self._tqdm(
-            total=dl_count,
-            desc="Downloading products",
-            unit="product",
-        )
+
         if offline_prods:
             trigger_executor = ThreadPoolExecutor(
                 max_workers=min(self.api.concurrent_lta_trigger_limit, len(offline_prods)),
                 thread_name_prefix="trigger",
             )
-            trigger_progress = self._tqdm(
-                total=len(offline_prods),
-                desc="LTA retrieval",
-                unit="product",
-                leave=True,
-            )
+
         try:
             # First all online products are downloaded. Subsequently, offline products that might
             # have become available in the meantime are requested.
@@ -338,19 +335,17 @@ class Downloader:
                     if not exception:
                         product_infos[pid] = task.result()
                         statuses[pid] = DownloadStatus.DOWNLOADED
-                    dl_progress.update()
                     # Keep the LTA progress fresh
                     if offline_prods:
-                        trigger_progress.update(0)
+                        pass
                 else:
-                    trigger_progress.update()
                     if all(t.done() for t in trigger_tasks):
-                        trigger_progress.close()
+                        pass
 
                 if exception:
                     exceptions[pid] = exception
                     if self.fail_fast:
-                        raise exception from None
+                        raise exception
                     else:
                         self.logger.error("%s failed: %s", pid, _format_exception(exception))
         except:
@@ -360,10 +355,8 @@ class Downloader:
             raise
         finally:
             dl_executor.shutdown()
-            dl_progress.close()
             if offline_prods:
                 trigger_executor.shutdown()
-                trigger_progress.close()
 
         if not any(statuses):
             if not exceptions:
@@ -387,9 +380,7 @@ class Downloader:
         product_infos = {}
         exceptions = {}
         # Get online status and product info.
-        for pid in self._tqdm(
-            iterable=product_ids, desc="Fetching archival status", unit="product", delay=2
-        ):
+        for pid in product_ids:
             assert isinstance(pid, str)
             try:
                 info = self.api.get_product_odata(pid)
@@ -490,15 +481,15 @@ class Downloader:
             return False
         elif r.status_code == 403:
             # cause: 'User 'username' offline products retrieval quota exceeded (20 fetches max) trying to fetch product PRODUCT_FILENAME (BYTES_COUNT bytes compressed)'
-            msg = f"User quota exceeded: {cause}"
+            msg = "User quota exceeded: {}".format(cause)
             self.logger.error(msg)
             raise LTAError(msg, r)
         elif r.status_code == 503:
-            msg = f"Request not accepted: {cause}"
+            msg = "Request not accepted: {}".format(cause)
             self.logger.error(msg)
             raise LTAError(msg, r)
         elif r.status_code < 400:
-            msg = f"Unexpected response {r.status_code}: {cause}"
+            msg = "Unexpected response {}: {}".format(r.status_code,cause)
             self.logger.error(msg)
             raise ServerError(msg, r)
         self.api._check_scihub_response(r, test_json=False)
@@ -635,7 +626,7 @@ class Downloader:
                     raise concurrent.futures.CancelledError()
                 if self.lta_timeout and time.time() - t0 >= self.lta_timeout:
                     raise LTAError(
-                        f"LTA retrieval for {uuid} timed out (lta_timeout={self.lta_timeout} seconds)"
+                        "LTA retrieval for {} timed out (lta_timeout={} seconds)".format(uuid,self.lta_timeout)
                     )
                 try:
                     if self.api.is_online(uuid):
@@ -731,31 +722,24 @@ class Downloader:
         downloaded_bytes = 0
         with self.api.dl_limit_semaphore:
             r = self.api.session.get(url, stream=True, headers=headers)
-        with self._tqdm(
-            desc=f"Downloading {title}",
-            total=file_size,
-            unit="B",
-            unit_scale=True,
-            initial=already_downloaded_bytes,
-        ) as progress, closing(r):
-            self.api._check_scihub_response(r, test_json=False)
-            mode = "ab" if continuing else "wb"
-            with open(path, mode) as f:
-                iterator = r.iter_content(chunk_size=self.chunk_size)
-                while True:
-                    if stop_event and stop_event.is_set():
-                        raise concurrent.futures.CancelledError()
-                    try:
-                        with self.api.dl_limit_semaphore:
-                            chunk = next(iterator)
-                    except StopIteration:
-                        break
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-                        progress.update(len(chunk))
-                        downloaded_bytes += len(chunk)
-            # Return the number of bytes downloaded
-            return downloaded_bytes
+
+        self.api._check_scihub_response(r, test_json=False)
+        mode = "ab" if continuing else "wb"
+        with open(path, mode) as f:
+            iterator = r.iter_content(chunk_size=self.chunk_size)
+            while True:
+                if stop_event and stop_event.is_set():
+                    raise concurrent.futures.CancelledError()
+                try:
+                    with self.api.dl_limit_semaphore:
+                        chunk = next(iterator)
+                except StopIteration:
+                    break
+                if chunk:  # filter out keep-alive new chunks
+                    f.write(chunk)
+                    downloaded_bytes += len(chunk)
+        # Return the number of bytes downloaded
+        return downloaded_bytes
 
     def _dataobj_to_node_info(self, dataobj_info, product_info):
         path = dataobj_info["href"]
