@@ -448,7 +448,7 @@ class SentinelAPI:
                 self.logger.warning("Attempt {} failed".format(attempts))
                 err = e
         else:
-            raise Exception("Maximum retry (5) exceeded. Server error:", err, e)
+            raise Exception("Maximum retry (5) exceeded. Server error:", err)
 
         # store last status code (for testing)
         self._last_response = response
