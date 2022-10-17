@@ -1,7 +1,7 @@
 scn-sentinelsat
 ===========
 
-Forked from `sentinelsat <https://github.com/sentinelsat/sentinelsat>`
+Forked from `sentinelsat https://github.com/sentinelsat/sentinelsat`
 
 Sentinelsat makes searching, downloading and retrieving the metadata of `Sentinel
 <http://www.esa.int/Our_Activities/Observing_the_Earth/Copernicus/Overview4>`_
